@@ -1,4 +1,4 @@
-﻿param([switch]$Helper, [string]$Session)
+﻿param([switch]$Helper, [string]$Session, [switch]$Configure)
 $ErrorActionPreference = 'Stop'
 # Optional explicit paths for portable or custom installations.
 $HiddifyPath = ''
@@ -89,27 +89,17 @@ function Calibrate-Button($Process, $ConfigPath) {
 
 function Click-Connection($Process, $Position) {
     $Process.Refresh()
-    if ($Process.HasExited -or $Process.MainWindowHandle -eq 0) { throw 'Hiddify window is unavailable.' }
-    [LauncherMouse]::ShowWindow($Process.MainWindowHandle, 9) | Out-Null
-    if (![LauncherMouse]::SetForegroundWindow($Process.MainWindowHandle)) { throw 'Cannot focus Hiddify.' }
-    Start-Sleep -Milliseconds 500
+    $window = $script:HiddifyWindow
+    if ($Process.HasExited -or $window -eq [IntPtr]::Zero) { throw 'Hiddify window is unavailable.' }
     $rect = New-Object LauncherMouse+RECT
-    [LauncherMouse]::GetClientRect($Process.MainWindowHandle, [ref]$rect) | Out-Null
+    [LauncherMouse]::GetClientRect($window, [ref]$rect) | Out-Null
     if ($rect.Right -ne $Position.Width -or $rect.Bottom -ne $Position.Height) {
-        throw 'Hiddify window size changed. Delete Hiddify-button.json and recalibrate; disconnect manually if needed.'
+        throw 'Hiddify window size changed. Run Configure-Button.cmd again.'
     }
-    $point = New-Object LauncherMouse+POINT
-    $point.X = $Position.X; $point.Y = $Position.Y
-    [LauncherMouse]::ClientToScreen($Process.MainWindowHandle, [ref]$point) | Out-Null
-    # A different dialog must not receive the click.
-    $under = [LauncherMouse]::WindowFromPoint($point)
-    if ([LauncherMouse]::GetAncestor($under, 2) -ne $Process.MainWindowHandle -or
-        [LauncherMouse]::GetForegroundWindow() -ne $Process.MainWindowHandle) {
-        throw 'Hiddify is covered by another window. Close the dialog and retry.'
+    # Deliver input directly to Flutter's hidden view, without moving the pointer.
+    if (![LauncherMouse]::ClickHidden($window, [int]$Position.X, [int]$Position.Y)) {
+        throw 'Cannot send input to the hidden Flutter view. See Hiddify-ui-diagnostic.txt.'
     }
-    [LauncherMouse]::SetCursorPos($point.X, $point.Y) | Out-Null
-    [LauncherMouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
-    [LauncherMouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
 }
 
 if ($Helper) {
@@ -119,7 +109,48 @@ if ($Helper) {
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class LauncherMouse {
+ public delegate bool EnumProc(IntPtr h, IntPtr param);
+ [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback, IntPtr param);
+ [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc callback, IntPtr param);
+ [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder name, int count);
+ [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr wp, IntPtr lp, uint flags, uint timeout, out UIntPtr result);
+ public static IntPtr FindWindow(uint pid) {
+   IntPtr found = IntPtr.Zero;
+   EnumWindows((h, p) => {
+     uint owner; GetWindowThreadProcessId(h, out owner);
+     if (owner != pid) return true;
+     StringBuilder name = new StringBuilder(256); GetClassName(h, name, 256);
+     if (name.ToString().IndexOf("FLUTTER_RUNNER", StringComparison.OrdinalIgnoreCase) >= 0) {
+       found = h; return false;
+     }
+     return true;
+   }, IntPtr.Zero);
+   return found;
+ }
+ static bool Send(IntPtr h, uint msg, IntPtr wp, IntPtr lp) {
+   UIntPtr result;
+   return SendMessageTimeout(h, msg, wp, lp, 2, 1000, out result) != IntPtr.Zero;
+ }
+ public static bool ClickHidden(IntPtr root, int x, int y) {
+   IntPtr view = IntPtr.Zero;
+   EnumChildWindows(root, (h, p) => {
+     StringBuilder name = new StringBuilder(256); GetClassName(h, name, 256);
+     if (name.ToString().Equals("FLUTTERVIEW", StringComparison.OrdinalIgnoreCase)) { view = h; return false; }
+     return true;
+   }, IntPtr.Zero);
+   if (view == IntPtr.Zero) return false;
+   POINT point = new POINT { X=x, Y=y };
+   if (!ClientToScreen(root, ref point) || !ScreenToClient(view, ref point)) return false;
+   RECT rect = new RECT(); GetClientRect(view, ref rect);
+   if (point.X < 0 || point.Y < 0 || point.X >= rect.Right || point.Y >= rect.Bottom) return false;
+   IntPtr lp = new IntPtr((point.Y << 16) | (point.X & 65535));
+   return Send(view, 0x0200, IntPtr.Zero, lp) &&
+          Send(view, 0x0201, new IntPtr(1), lp) && Send(view, 0x0202, IntPtr.Zero, lp);
+ }
+ public static bool CloseHidden(IntPtr h) { return Send(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -139,6 +170,7 @@ public static class LauncherMouse {
 '@
     [LauncherMouse]::SetProcessDPIAware() | Out-Null
     $h = $null; $position = $null
+    $script:HiddifyWindow = [IntPtr]::Zero
     $script:RpcDiagnostic = 'Not requested yet.'
     $script:LastCoreState = 'UNKNOWN'
     try {
@@ -159,22 +191,38 @@ public static class LauncherMouse {
         if ((Get-FileHash -LiteralPath $grpcExe -Algorithm SHA256).Hash -ne $expectedHash) {
             throw 'grpcurl.exe checksum mismatch. Download and extract a fresh archive.'
         }
-        $h = Start-Process -FilePath $exe -PassThru
+        if (!$Configure -and !(Test-Path (Join-Path $PSScriptRoot 'Hiddify-button.json'))) {
+            throw 'Сначала запустите Configure-Button.cmd для настройки кнопки Hiddify.'
+        }
+        if ($Configure) { $h = Start-Process -FilePath $exe -PassThru }
+        else { $h = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru }
         $deadline = (Get-Date).AddSeconds(45)
         do {
             $h.Refresh()
             if ($h.HasExited) { throw 'Hiddify exited during startup.' }
-            if ((Get-Date) -gt $deadline) { throw 'Hiddify Home window did not open. Disable silent startup.' }
-            Start-Sleep -Milliseconds 500
-        } while ($h.MainWindowHandle -eq 0)
+            $script:HiddifyWindow = [LauncherMouse]::FindWindow([uint32]$h.Id)
+            if (!$Configure -and $script:HiddifyWindow -ne [IntPtr]::Zero) {
+                [LauncherMouse]::ShowWindow($script:HiddifyWindow, 0) | Out-Null
+            }
+            if ((Get-Date) -gt $deadline) { throw 'Hiddify native window did not initialize.' }
+            Start-Sleep -Milliseconds 50
+        } while ($script:HiddifyWindow -eq [IntPtr]::Zero)
         $configPath = Join-Path $PSScriptRoot 'Hiddify-button.json'
+        if ($Configure) {
+            [LauncherMouse]::ShowWindow($script:HiddifyWindow, 9) | Out-Null
+            Start-Sleep -Seconds 2
+            $position = Calibrate-Button $h $configPath
+            Set-Content -LiteralPath "$Session\ready" -Value 'configured'
+            return
+        }
         if (Test-Path -LiteralPath $configPath) {
             $position = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-        } else { $position = Calibrate-Button $h $configPath }
+        } else { throw 'Run Configure-Button.cmd first.' }
         $deadline = (Get-Date).AddSeconds(20)
         $state = Read-ConnectionState
         while ($state -eq 'UNKNOWN' -and (Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
+            if (!$Configure) { [LauncherMouse]::ShowWindow($script:HiddifyWindow, 0) | Out-Null }
             $state = Read-ConnectionState
         }
         if ($state -eq 'UNKNOWN') {
@@ -185,6 +233,7 @@ public static class LauncherMouse {
         $connectingSeen = $false
         do {
             if (Test-Path "$Session\stop") { throw 'Launch cancelled.' }
+            if (!$Configure) { [LauncherMouse]::ShowWindow($script:HiddifyWindow, 0) | Out-Null }
             $state = Read-ConnectionState
             if ($state -eq 'CONNECTED') { break }
             if ($state -eq 'CONNECTING') { $connectingSeen = $true }
@@ -196,6 +245,7 @@ public static class LauncherMouse {
         while (!(Test-Path "$Session\stop")) {
             $h.Refresh()
             if ($h.HasExited) { throw 'Hiddify closed while Chrome was open.' }
+            [LauncherMouse]::ShowWindow($script:HiddifyWindow, 0) | Out-Null
             Start-Sleep -Seconds 1
         }
     } catch {
@@ -213,11 +263,11 @@ public static class LauncherMouse {
                     if ((Get-Date) -gt $deadline) { throw 'Disconnection not confirmed. Disconnect and exit Hiddify manually.' }
                     Start-Sleep -Milliseconds 500
                 }
-                if (!$h.CloseMainWindow()) { throw 'Cannot close Hiddify. Exit it manually using its tray menu.' }
+                if (![LauncherMouse]::CloseHidden($script:HiddifyWindow)) { throw 'Cannot close Hiddify. Exit it manually using its tray menu.' }
                 if (!$h.WaitForExit(15000)) { throw 'Hiddify did not exit. Select Exit as the window-close action, then exit manually.' }
             } catch { Add-Content -LiteralPath "$Session\error" -Value $_.Exception.Message -Encoding UTF8 }
         }
-        @('Launcher mode: calibrated mouse + local core API', "Last core state observed: $script:LastCoreState",
+        @('Launcher mode: hidden Flutter input + local core API', "Last core state observed: $script:LastCoreState",
             "Local API diagnostic: $script:RpcDiagnostic", "Calibration available: $([bool]$position)") |
             Set-Content -LiteralPath "$Session\ui-diagnostic.txt" -Encoding UTF8
         Set-Content -LiteralPath "$Session\done" -Value 'finished'
@@ -225,6 +275,26 @@ public static class LauncherMouse {
     exit
 }
 
+Add-Type -AssemblyName @('System.Windows.Forms', 'System.Drawing')
+$loading = $null
+if (!$Configure) {
+    $loading = New-Object System.Windows.Forms.Form
+    $loading.Text = 'Загрузка…'
+    $loading.ClientSize = New-Object System.Drawing.Size(260, 85)
+    $loading.StartPosition = 'CenterScreen'
+    $loading.FormBorderStyle = 'FixedDialog'
+    $loading.ControlBox = $false
+    $loading.ShowInTaskbar = $false
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = 'Загрузка...'
+    $label.Dock = 'Fill'
+    $label.TextAlign = 'MiddleCenter'
+    $label.Font = New-Object System.Drawing.Font('Segoe UI', 14)
+    $loading.Controls.Add($label)
+    $loading.Show()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+$errorText = ''
 $helperProcess = $null
 $chrome = $null
 $Session = Join-Path $env:TEMP ('HiddifyChatGPT-' + [guid]::NewGuid().ToString('N'))
@@ -241,15 +311,18 @@ try {
         Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profile) }
     if ($existing) { throw 'The dedicated ChatGPT Chrome session is already running.' }
     Write-Host 'Starting Hiddify. Accept UAC. On first run, hover over its connection button and press F8.'
-    $args = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -Helper -Session "{1}"' -f $PSCommandPath, $Session
-    $helperProcess = Start-Process powershell.exe -Verb RunAs -ArgumentList $args -PassThru
+    $args = '-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -Helper -Session "{1}"' -f $PSCommandPath, $Session
+    if ($Configure) { $args = $args.Replace('-WindowStyle Hidden ', '') + ' -Configure' }
+    $helperProcess = Start-Process powershell.exe -Verb RunAs -ArgumentList $args -WindowStyle $(if ($Configure) { 'Normal' } else { 'Hidden' }) -PassThru
     $deadline = (Get-Date).AddSeconds(240)
     while (!(Test-Path "$Session\ready")) {
         if (Test-Path "$Session\error") { throw (Get-Content "$Session\error" -Raw) }
         if ($helperProcess.HasExited) { throw 'Hiddify helper exited before connection was established.' }
         if ((Get-Date) -gt $deadline) { throw 'Connection startup timed out.' }
-        Start-Sleep -Milliseconds 500
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
     }
+    if (!$Configure) {
     $browserArgs = '--user-data-dir="{0}" --no-first-run --no-default-browser-check --disable-background-mode --app=https://chatgpt.com' -f $profile
     $chrome = Start-Process -FilePath $exe -ArgumentList $browserArgs -PassThru
     $deadline = (Get-Date).AddSeconds(45)
@@ -257,28 +330,35 @@ try {
         $chrome.Refresh()
         if ($chrome.HasExited) { throw 'Chrome exited before its window opened.' }
         if ((Get-Date) -gt $deadline) { throw 'Chrome window did not open.' }
-        Start-Sleep -Milliseconds 500
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
     } while ($chrome.MainWindowHandle -eq 0)
+    if ($loading) { $loading.Close(); $loading.Dispose(); $loading = $null }
     Write-Host 'Close the dedicated ChatGPT window to disconnect and exit Hiddify.'
     while (!$chrome.HasExited -and $chrome.MainWindowHandle -ne 0) {
         if (Test-Path "$Session\error") { throw (Get-Content "$Session\error" -Raw) }
         Start-Sleep -Seconds 1
         $chrome.Refresh()
     }
+    }
 } catch {
     $failed = $true
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    $errorText = $_.Exception.Message
+    Write-Host $errorText -ForegroundColor Red
 } finally {
+    if ($loading) { $loading.Close(); $loading.Dispose(); $loading = $null }
     if ($chrome -and !$chrome.HasExited) { $chrome.CloseMainWindow() | Out-Null }
     Set-Content -LiteralPath "$Session\stop" -Value 'stop'
     if ($helperProcess) {
         $deadline = (Get-Date).AddSeconds(50)
         while (!(Test-Path "$Session\done") -and !$helperProcess.HasExited -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 500
+            [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
         }
         if (!(Test-Path "$Session\done")) {
             $failed = $true
-            Write-Host 'Helper did not confirm cleanup. Check Hiddify and disconnect/exit manually.' -ForegroundColor Red
+            $errorText += "`nHelper did not confirm cleanup. Check Hiddify and disconnect/exit manually."
+            Write-Host $errorText -ForegroundColor Red
         }
     }
     if (Test-Path "$Session\ui-diagnostic.txt") {
@@ -290,8 +370,12 @@ try {
     }
     if (Test-Path "$Session\error") {
         $failed = $true
-        Write-Host (Get-Content "$Session\error" -Raw) -ForegroundColor Red
+        $errorText += "`n" + (Get-Content "$Session\error" -Raw)
+        Write-Host $errorText -ForegroundColor Red
     }
 }
-if ($failed) { exit 1 }
+if ($failed) {
+    [System.Windows.Forms.MessageBox]::Show($errorText.Trim(), 'Ошибка запуска', 'OK', 'Error') | Out-Null
+    exit 1
+}
 Write-Host 'Hiddify connection stopped and application exited.'
