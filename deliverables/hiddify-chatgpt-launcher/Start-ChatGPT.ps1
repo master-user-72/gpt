@@ -15,18 +15,65 @@ function Find-Program($Explicit, $Candidates) {
     throw 'Application not found. Set HiddifyPath / ChromePath at the top of Start-ChatGPT.ps1.'
 }
 
-function Connection-Button($Process, $Names) {
+function Connection-Button($Process, $Names, [switch]$StateOnly) {
     $Process.Refresh()
     if ($Process.HasExited -or $Process.MainWindowHandle -eq 0) { return $null }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($Process.MainWindowHandle)
     $items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.Condition]::TrueCondition)
     foreach ($item in $items) {
-        if ($Names -contains $item.Current.Name -and $item.Current.IsEnabled -and !$item.Current.IsOffscreen) {
-            if ($item.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) { return $item }
+        if (!$item.Current.IsEnabled -or $item.Current.IsOffscreen) { continue }
+        $label = ($item.Current.Name -replace '[\u200B-\u200F\uFEFF]', '').Trim()
+        $matches = $false
+        foreach ($name in $Names) {
+            # Flutter may merge a button label with a second line (latency / hint).
+            if ($label -eq $name -or $label.StartsWith($name + "`n", [StringComparison]::OrdinalIgnoreCase) -or $label.StartsWith($name + "`r", [StringComparison]::OrdinalIgnoreCase)) {
+                $matches = $true; break
+            }
+        }
+        if (!$matches) { continue }
+        if ($StateOnly) { return $item }
+        $candidate = $item
+        for ($i = 0; $i -lt 4 -and $candidate; $i++) {
+            $pattern = $null
+            if ($candidate.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -or
+                $candidate.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+                return $candidate
+            }
+            $candidate = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($candidate)
         }
     }
     return $null
+}
+
+function Save-UiDiagnostic($Process, $Clicked) {
+    try {
+        $Process.Refresh()
+        $version = (Get-Item -LiteralPath $Process.Path).VersionInfo.FileVersion
+        $report = @("Hiddify version: $version", "Connect click dispatched: $Clicked",
+            "Window handle: $($Process.MainWindowHandle)", "Process exited: $($Process.HasExited)")
+        if (!$Process.HasExited -and $Process.MainWindowHandle -ne 0) {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($Process.MainWindowHandle)
+            $items = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)
+            $report += "UI Automation descendant count: $($items.Count)"
+            $counts = @{}
+            foreach ($item in $items) {
+                $type = $item.Current.ControlType.ProgrammaticName
+                if (!$counts.ContainsKey($type)) { $counts[$type] = 0 }
+                $counts[$type]++
+                # Export only connection-related labels, not profiles, URLs or app logs.
+                $label = $item.Current.Name
+                if ($label -match '^(Tap to connect|Connect(ed|ing)?|Disconnect(ed|ing)?|Нажмите для подключения|Подключ(ить|ено|ение)|Отключ(ить|ено|ение))[.!…\s]*$') {
+                    $report += "$type | $label | enabled=$($item.Current.IsEnabled) | offscreen=$($item.Current.IsOffscreen)"
+                }
+            }
+            foreach ($key in ($counts.Keys | Sort-Object)) { $report += "$key count: $($counts[$key])" }
+        }
+        $report | Set-Content -LiteralPath "$Session\ui-diagnostic.txt" -Encoding UTF8
+    } catch {
+        "Diagnostic error: $($_.Exception.Message)" | Set-Content -LiteralPath "$Session\ui-diagnostic.txt" -Encoding UTF8
+    }
 }
 
 function Click-Button($Button, $Process) {
@@ -48,18 +95,31 @@ if ($Helper) {
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (!$admin) { throw 'Administrator privileges required for the Hiddify helper.' }
-    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    Add-Type -AssemblyName @('UIAutomationClient', 'UIAutomationTypes')
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class NativeClick {
+ public delegate bool EnumProc(IntPtr h, IntPtr p);
+ [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc callback, IntPtr p);
+ [DllImport("oleacc.dll")] static extern int AccessibleObjectFromWindow(IntPtr h, uint id, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out object obj);
+ static void RequestAccessibility(IntPtr h) {
+   Guid iid = new Guid("618736e0-3c3d-11cf-810c-00aa00389b71");
+   object obj;
+   int result = AccessibleObjectFromWindow(h, unchecked((uint)-4), ref iid, out obj);
+   if (result >= 0 && obj != null && Marshal.IsComObject(obj)) Marshal.ReleaseComObject(obj);
+ }
+ public static void EnableAccessibility(IntPtr h) {
+   RequestAccessibility(h);
+   EnumChildWindows(h, (child, param) => { RequestAccessibility(child); return true; }, IntPtr.Zero);
+ }
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
  [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,UIntPtr extra);
 }
 '@
-    $off = @('Tap to connect', 'Нажмите для подключения', 'Connect', 'Подключить')
+    $off = @('Tap to connect', 'Нажмите для подключения')
     $on = @('Connected', 'Подключено', 'Disconnect', 'Отключить')
     $h = $null
     try {
@@ -73,18 +133,28 @@ public static class NativeClick {
         $h = Start-Process -FilePath $exe -PassThru
         $deadline = (Get-Date).AddSeconds(60)
         $clicked = $false
+        $accessibilityRequested = $false
         $ready = $false
         while ((Get-Date) -lt $deadline) {
             if (Test-Path "$Session\stop") { throw 'Launch cancelled.' }
             $h.Refresh()
             if ($h.HasExited) { throw 'Hiddify exited during startup.' }
-            if (Connection-Button $h $on) { $ready = $true; break }
+            if (!$accessibilityRequested -and $h.MainWindowHandle -ne 0) {
+                [NativeClick]::EnableAccessibility($h.MainWindowHandle)
+                $accessibilityRequested = $true
+                Start-Sleep -Seconds 1
+            }
+            if (Connection-Button $h $on -StateOnly) { $ready = $true; break }
             $button = Connection-Button $h $off
             if ($button -and !$clicked) { Click-Button $button $h; $clicked = $true }
             Start-Sleep -Milliseconds 500
         }
         if (!$ready) {
-            throw 'Cannot confirm connection through Hiddify UI. Check profile, visible Home screen and UI Automation support.'
+            Save-UiDiagnostic $h $clicked
+            if ($clicked) {
+                throw 'Connect was clicked, but connected status was not found. See Hiddify-ui-diagnostic.txt.'
+            }
+            throw 'Connect button was not available through UI Automation. See Hiddify-ui-diagnostic.txt.'
         }
         Set-Content -LiteralPath "$Session\ready" -Value 'connected'
         while (!(Test-Path "$Session\stop")) {
@@ -100,7 +170,7 @@ public static class NativeClick {
                 $button = Connection-Button $h $on
                 if ($button) { Click-Button $button $h }
                 $deadline = (Get-Date).AddSeconds(30)
-                while (!(Connection-Button $h $off)) {
+                while (!(Connection-Button $h $off -StateOnly)) {
                     if ((Get-Date) -gt $deadline) { throw 'Disconnection not confirmed. Disconnect and exit Hiddify manually.' }
                     Start-Sleep -Milliseconds 500
                 }
@@ -172,6 +242,13 @@ try {
             $failed = $true
             Write-Host 'Helper did not confirm cleanup. Check Hiddify and disconnect/exit manually.' -ForegroundColor Red
         }
+    }
+    if (Test-Path "$Session\ui-diagnostic.txt") {
+        $diagnostic = Join-Path $PSScriptRoot 'Hiddify-ui-diagnostic.txt'
+        try {
+            Copy-Item -LiteralPath "$Session\ui-diagnostic.txt" -Destination $diagnostic -Force
+            Write-Host "Diagnostic report: $diagnostic"
+        } catch { Write-Host "Diagnostic report remains at: $Session\ui-diagnostic.txt" }
     }
     if (Test-Path "$Session\error") {
         $failed = $true
