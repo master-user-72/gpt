@@ -15,28 +15,48 @@ function Find-Program($Explicit, $Candidates) {
     throw 'Application not found. Set HiddifyPath / ChromePath at the top of Start-ChatGPT.ps1.'
 }
 
-# Hiddify Flutter controls can be absent from the Windows accessibility tree.
-# Use a user-calibrated button position and fresh application log events instead.
+# Read the same local core status stream that the Hiddify desktop app uses.
 function Read-ConnectionState {
-    foreach ($path in $script:LogCandidates) {
-        if (!(Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        try {
-            $file = Get-Item -LiteralPath $path
-            if ($file.LastWriteTime -lt $script:LaunchTime) { continue }
-            $text = [IO.File]::ReadAllText($path)
-            $offset = 0
-            if ($script:LogBaseline.ContainsKey($path)) {
-                $base = $script:LogBaseline[$path]
-                if ($text.StartsWith($base.Prefix) -and $text.Length -ge $base.Length) { $offset = $base.Length }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $PSScriptRoot 'tools\grpcurl.exe'
+    $tools = Join-Path $PSScriptRoot 'tools'
+    $psi.Arguments = '-plaintext -max-time 1 -emit-defaults -import-path "{0}" -proto core-status.proto -d "{{}}" 127.0.0.1:17078 hcore.Core/CoreInfoListener' -f $tools
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $rpc = New-Object System.Diagnostics.Process
+    $rpc.StartInfo = $psi
+    try {
+        $rpc.Start() | Out-Null
+        $stdoutTask = $rpc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $rpc.StandardError.ReadToEndAsync()
+        if (!$rpc.WaitForExit(5000)) {
+            $rpc.Kill()
+            $script:RpcDiagnostic = 'Local status request timed out.'
+            return 'UNKNOWN'
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $states = [regex]::Matches($stdout, '"coreState"\s*:\s*"(STOPPED|STARTING|STARTED|STOPPING)"')
+        if ($states.Count -gt 0) {
+            $script:RpcDiagnostic = 'Status received; stream deadline after the response is expected.'
+            $script:LastCoreState = $states[$states.Count - 1].Groups[1].Value
+            switch ($script:LastCoreState) {
+                'STOPPED' { return 'DISCONNECTED' }
+                'STARTING' { return 'CONNECTING' }
+                'STARTED' { return 'CONNECTED' }
+                'STOPPING' { return 'DISCONNECTING' }
             }
-            $events = [regex]::Matches($text.Substring($offset),
-                'connection status:\s*(CONNECTED|DISCONNECTED|CONNECTING|DISCONNECTING|CONNECTION FAILURE)(?![A-Z])')
-            if ($events.Count -gt 0) {
-                return $events[$events.Count - 1].Groups[1].Value
-            }
-        } catch { }
-    }
-    return 'UNKNOWN'
+        }
+        # This stderr contains only a local RPC transport/status error, no profiles.
+        $script:RpcDiagnostic = $stderr.Trim()
+        if (!$script:RpcDiagnostic) { $script:RpcDiagnostic = 'Local API returned no status.' }
+        return 'UNKNOWN'
+    } catch {
+        $script:RpcDiagnostic = $_.Exception.Message
+        return 'UNKNOWN'
+    } finally { $rpc.Dispose() }
 }
 
 function Calibrate-Button($Process, $ConfigPath) {
@@ -119,8 +139,8 @@ public static class LauncherMouse {
 '@
     [LauncherMouse]::SetProcessDPIAware() | Out-Null
     $h = $null; $position = $null
-    $script:LogCandidates = @()
-    $script:LogBaseline = @{}
+    $script:RpcDiagnostic = 'Not requested yet.'
+    $script:LastCoreState = 'UNKNOWN'
     try {
         if (Get-Process -Name Hiddify -ErrorAction SilentlyContinue) {
             throw 'Close the existing Hiddify instance before starting this launcher.'
@@ -129,29 +149,16 @@ public static class LauncherMouse {
             "$env:ProgramFiles\Hiddify\Hiddify.exe",
             "${env:ProgramFiles(x86)}\Hiddify\Hiddify.exe",
             "$env:LOCALAPPDATA\Programs\Hiddify\Hiddify.exe")
-        $script:LogCandidates = @(
-            "$env:APPDATA\Hiddify\hiddify\app.log",
-            "$env:APPDATA\Hiddify\app.log",
-            "$env:LOCALAPPDATA\Hiddify\hiddify\app.log",
-            (Join-Path (Split-Path $exe) 'hiddify_portable_data\app.log'))
-        foreach ($root in @("$env:APPDATA\Hiddify", "$env:LOCALAPPDATA\Hiddify")) {
-            if (Test-Path -LiteralPath $root) {
-                $script:LogCandidates += @(Get-ChildItem -LiteralPath $root -Filter app.log -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-            }
+        $grpcExe = Join-Path $PSScriptRoot 'tools\grpcurl.exe'
+        $manifest = Join-Path $PSScriptRoot 'tools\grpcurl-sha256.txt'
+        if (!(Test-Path -LiteralPath $grpcExe) -or !(Test-Path -LiteralPath $manifest)) {
+            throw 'tools/grpcurl.exe is missing. Extract the entire ZIP, including its tools folder.'
         }
-        # Optional explicit log path for nonstandard / MS Store installations.
-        $logOverride = Join-Path $PSScriptRoot 'Hiddify-log-path.txt'
-        if (Test-Path -LiteralPath $logOverride) {
-            $script:LogCandidates = @((Get-Content -LiteralPath $logOverride -Raw).Trim())
+        $expectedLine = Get-Content -LiteralPath $manifest | Where-Object { $_ -like 'grpcurl.exe SHA256: *' }
+        $expectedHash = ($expectedLine -replace '^grpcurl.exe SHA256: ', '').Trim()
+        if ((Get-FileHash -LiteralPath $grpcExe -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw 'grpcurl.exe checksum mismatch. Download and extract a fresh archive.'
         }
-        $script:LogCandidates = @($script:LogCandidates | Select-Object -Unique)
-        foreach ($path in $script:LogCandidates) {
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
-                $old = [IO.File]::ReadAllText($path)
-                $script:LogBaseline[$path] = @{ Length = $old.Length; Prefix = $old.Substring(0, [Math]::Min(64, $old.Length)) }
-            }
-        }
-        $script:LaunchTime = Get-Date
         $h = Start-Process -FilePath $exe -PassThru
         $deadline = (Get-Date).AddSeconds(45)
         do {
@@ -171,7 +178,7 @@ public static class LauncherMouse {
             $state = Read-ConnectionState
         }
         if ($state -eq 'UNKNOWN') {
-            throw 'Cannot find fresh Hiddify app.log status. Create Hiddify-log-path.txt beside the script with the full path to app.log.'
+            throw 'Cannot read the local Hiddify core API. See Hiddify-ui-diagnostic.txt for its transport error.'
         }
         if ($state -eq 'DISCONNECTED' -or $state -eq 'CONNECTION FAILURE') { Click-Connection $h $position }
         $deadline = (Get-Date).AddSeconds(60)
@@ -210,8 +217,8 @@ public static class LauncherMouse {
                 if (!$h.WaitForExit(15000)) { throw 'Hiddify did not exit. Select Exit as the window-close action, then exit manually.' }
             } catch { Add-Content -LiteralPath "$Session\error" -Value $_.Exception.Message -Encoding UTF8 }
         }
-        @('Launcher mode: calibrated mouse + fresh log events', "Last state: $(Read-ConnectionState)",
-            "Log candidate count: $($script:LogCandidates.Count)", "Calibration available: $([bool]$position)") |
+        @('Launcher mode: calibrated mouse + local core API', "Last core state observed: $script:LastCoreState",
+            "Local API diagnostic: $script:RpcDiagnostic", "Calibration available: $([bool]$position)") |
             Set-Content -LiteralPath "$Session\ui-diagnostic.txt" -Encoding UTF8
         Set-Content -LiteralPath "$Session\done" -Value 'finished'
     }

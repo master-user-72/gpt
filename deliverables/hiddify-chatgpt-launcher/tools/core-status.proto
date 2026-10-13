@@ -1,0 +1,17 @@
+syntax = "proto3";
+package hcore;
+
+// Minimal wire-compatible subset of Hiddify v4.1.1's read-only status API.
+message Empty {}
+enum CoreStates {
+  STOPPED = 0;
+  STARTING = 1;
+  STARTED = 2;
+  STOPPING = 3;
+}
+message CoreInfoResponse {
+  CoreStates core_state = 1;
+}
+service Core {
+  rpc CoreInfoListener(Empty) returns (stream CoreInfoResponse);
+}
