@@ -15,12 +15,12 @@ function Find-Program($Explicit, $Candidates) {
     throw 'Application not found. Set HiddifyPath / ChromePath at the top of Start-ChatGPT.ps1.'
 }
 
-# Read the same local core status stream that the Hiddify desktop app uses.
-function Read-ConnectionState {
+# Use the same local core API as the Hiddify desktop app.
+function Invoke-CoreRpc([string]$Method, [int]$MaxSeconds = 1) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $PSScriptRoot 'tools\grpcurl.exe'
     $tools = Join-Path $PSScriptRoot 'tools'
-    $psi.Arguments = '-plaintext -max-time 1 -emit-defaults -import-path "{0}" -proto core-status.proto -d "{{}}" 127.0.0.1:17078 hcore.Core/CoreInfoListener' -f $tools
+    $psi.Arguments = '-plaintext -max-time {0} -emit-defaults -import-path "{1}" -proto core-status.proto -d "{{}}" 127.0.0.1:17078 hcore.Core/{2}' -f $MaxSeconds, $tools, $Method
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -31,32 +31,55 @@ function Read-ConnectionState {
         $rpc.Start() | Out-Null
         $stdoutTask = $rpc.StandardOutput.ReadToEndAsync()
         $stderrTask = $rpc.StandardError.ReadToEndAsync()
-        if (!$rpc.WaitForExit(5000)) {
+        if (!$rpc.WaitForExit(($MaxSeconds + 4) * 1000)) {
             $rpc.Kill()
-            $script:RpcDiagnostic = 'Local status request timed out.'
-            return 'UNKNOWN'
+            return [pscustomobject]@{ Output = ''; Error = 'Local API request timed out.'; ExitCode = -1 }
         }
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $states = [regex]::Matches($stdout, '"coreState"\s*:\s*"(STOPPED|STARTING|STARTED|STOPPING)"')
-        if ($states.Count -gt 0) {
-            $script:RpcDiagnostic = 'Status received; stream deadline after the response is expected.'
-            $script:LastCoreState = $states[$states.Count - 1].Groups[1].Value
-            switch ($script:LastCoreState) {
-                'STOPPED' { return 'DISCONNECTED' }
-                'STARTING' { return 'CONNECTING' }
-                'STARTED' { return 'CONNECTED' }
-                'STOPPING' { return 'DISCONNECTING' }
-            }
+        return [pscustomobject]@{
+            Output = $stdoutTask.GetAwaiter().GetResult()
+            Error = $stderrTask.GetAwaiter().GetResult().Trim()
+            ExitCode = $rpc.ExitCode
         }
-        # This stderr contains only a local RPC transport/status error, no profiles.
-        $script:RpcDiagnostic = $stderr.Trim()
-        if (!$script:RpcDiagnostic) { $script:RpcDiagnostic = 'Local API returned no status.' }
-        return 'UNKNOWN'
     } catch {
-        $script:RpcDiagnostic = $_.Exception.Message
-        return 'UNKNOWN'
+        return [pscustomobject]@{ Output = ''; Error = $_.Exception.Message; ExitCode = -1 }
     } finally { $rpc.Dispose() }
+}
+
+function Read-ConnectionState {
+    $response = Invoke-CoreRpc 'CoreInfoListener'
+    $states = [regex]::Matches($response.Output, '"coreState"\s*:\s*"(STOPPED|STARTING|STARTED|STOPPING)"')
+    if ($states.Count -gt 0) {
+        $script:RpcDiagnostic = 'Status received; stream deadline after the response is expected.'
+        $script:LastCoreState = $states[$states.Count - 1].Groups[1].Value
+        switch ($script:LastCoreState) {
+            'STOPPED' { return 'DISCONNECTED' }
+            'STARTING' { return 'CONNECTING' }
+            'STARTED' { return 'CONNECTED' }
+            'STOPPING' { return 'DISCONNECTING' }
+        }
+    }
+    $script:RpcDiagnostic = $response.Error
+    if (!$script:RpcDiagnostic) { $script:RpcDiagnostic = 'Local API returned no status.' }
+    return 'UNKNOWN'
+}
+
+function Stop-Connection {
+    # Do not toggle a hidden button: Stop is explicit and does not reconnect.
+    $response = Invoke-CoreRpc 'Stop' 8
+    if ($response.ExitCode -eq 0) { $script:StopRpcDiagnostic = 'Stop request accepted.' }
+    else { $script:StopRpcDiagnostic = "Stop RPC error: $($response.Error)" }
+    $deadline = (Get-Date).AddSeconds(25)
+    do {
+        $state = Read-ConnectionState
+        if ($state -eq 'DISCONNECTED') {
+            $script:StopRpcDiagnostic += ' STOPPED confirmed by a separate status request.'
+            return
+        }
+        if ((Get-Date) -gt $deadline) {
+            throw "Hiddify Stop did not reach STOPPED. $script:StopRpcDiagnostic Disconnect manually."
+        }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
 }
 
 function Calibrate-Button($Process, $ConfigPath) {
@@ -173,6 +196,8 @@ public static class LauncherMouse {
     $script:HiddifyWindow = [IntPtr]::Zero
     $script:RpcDiagnostic = 'Not requested yet.'
     $script:LastCoreState = 'UNKNOWN'
+    $script:StopRpcDiagnostic = 'Not requested.'
+    $script:ExitMethod = 'Not requested.'
     try {
         if (Get-Process -Name Hiddify -ErrorAction SilentlyContinue) {
             throw 'Close the existing Hiddify instance before starting this launcher.'
@@ -253,22 +278,26 @@ public static class LauncherMouse {
     } finally {
         if ($h -and !$h.HasExited) {
             try {
-                $disconnectSent = $false
-                $deadline = (Get-Date).AddSeconds(30)
-                while ((Read-ConnectionState) -notin @('DISCONNECTED', 'CONNECTION FAILURE')) {
-                    if ((Read-ConnectionState) -eq 'CONNECTED' -and $position -and !$disconnectSent) {
-                        Click-Connection $h $position
-                        $disconnectSent = $true
+                Stop-Connection
+                # Only close the Hiddify process this helper started, after STOPPED.
+                # WM_CLOSE may hide the GUI in the tray according to the user's setting.
+                $null = [LauncherMouse]::CloseHidden($script:HiddifyWindow)
+                if ($h.WaitForExit(5000)) {
+                    $script:ExitMethod = 'Exited after WM_CLOSE.'
+                } else {
+                    # Recheck immediately before terminating the disconnected GUI.
+                    if ((Read-ConnectionState) -ne 'DISCONNECTED') {
+                        throw 'Hiddify is no longer confirmed STOPPED; application was left running.'
                     }
-                    if ((Get-Date) -gt $deadline) { throw 'Disconnection not confirmed. Disconnect and exit Hiddify manually.' }
-                    Start-Sleep -Milliseconds 500
+                    $h.Kill()
+                    if (!$h.WaitForExit(5000)) { throw 'The disconnected Hiddify GUI did not exit.' }
+                    $script:ExitMethod = 'Disconnected GUI terminated after tray-only WM_CLOSE.'
                 }
-                if (![LauncherMouse]::CloseHidden($script:HiddifyWindow)) { throw 'Cannot close Hiddify. Exit it manually using its tray menu.' }
-                if (!$h.WaitForExit(15000)) { throw 'Hiddify did not exit. Select Exit as the window-close action, then exit manually.' }
             } catch { Add-Content -LiteralPath "$Session\error" -Value $_.Exception.Message -Encoding UTF8 }
         }
         @('Launcher mode: hidden Flutter input + local core API', "Last core state observed: $script:LastCoreState",
-            "Local API diagnostic: $script:RpcDiagnostic", "Calibration available: $([bool]$position)") |
+            "Local API diagnostic: $script:RpcDiagnostic", "Stop diagnostic: $script:StopRpcDiagnostic",
+            "Application exit: $script:ExitMethod", "Calibration available: $([bool]$position)") |
             Set-Content -LiteralPath "$Session\ui-diagnostic.txt" -Encoding UTF8
         Set-Content -LiteralPath "$Session\done" -Value 'finished'
     }
@@ -350,7 +379,7 @@ try {
     if ($chrome -and !$chrome.HasExited) { $chrome.CloseMainWindow() | Out-Null }
     Set-Content -LiteralPath "$Session\stop" -Value 'stop'
     if ($helperProcess) {
-        $deadline = (Get-Date).AddSeconds(50)
+        $deadline = (Get-Date).AddSeconds(65)
         while (!(Test-Path "$Session\done") -and !$helperProcess.HasExited -and (Get-Date) -lt $deadline) {
             [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 100
